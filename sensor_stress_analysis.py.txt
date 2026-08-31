@@ -1,0 +1,113 @@
+import time, os, board, busio, sys, smbus2, statistics
+from adafruit_ads1x15.analog_in import AnalogIn
+import adafruit_ads1x15.ads1115 as ADS
+
+sys.modules['smbus'] = smbus2
+from max30102 import MAX30102
+import hrcalc 
+
+# 1. HARDWARE INITIALIZATION
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1115(i2c, gain=1) 
+m = MAX30102()
+
+chan_temp = AnalogIn(ads, 0) 
+chan_gsr = AnalogIn(ads, 1)  
+
+def get_filtered_temp(channel):
+    """Filters 30 samples to ensure stable LM35D readings"""
+    samples = [channel.voltage * 100 for _ in range(30)]
+    samples.sort()
+    return sum(samples[10:-10]) / 10
+
+def run_viva_final():
+    os.system('clear')
+    print("========================================")
+    print("      EMOSPHERE: DIAGNOSTIC MODE        ")
+    print("      Processing Biometric Data...      ")
+    print("========================================\n")
+
+    temp_readings, gsr_readings = [], []
+    ir_full, red_full = [], []
+
+    # 15-Second High-Resolution Collection
+    for i in range(40):
+        temp_readings.append(get_filtered_temp(chan_temp))
+        gsr_readings.append(chan_gsr.value)
+        
+        red, ir = m.read_sequential()
+        ir_full.extend(ir)
+        red_full.extend(red)
+
+        percent = int((i + 1) / 40 * 100)
+        bar = "#" * (i // 2)
+        sys.stdout.write(f"\rAnalysing: [{bar:<20}] {percent}%")
+        sys.stdout.flush()
+
+    # --- SENSOR CALCULATIONS ---
+    avg_temp = statistics.median(temp_readings)
+    temp_delta = abs(temp_readings[-1] - temp_readings[0])
+    avg_gsr = statistics.median(gsr_readings)
+    gsr_start = gsr_readings[0]
+    
+    # PEAK DETECTION (Hidden Math)
+    highest_bpm = 0
+    lowest_bpm = 999
+    heart_valid = False
+
+    for start_idx in [0, 100, 200, 300, 400]:
+        try:
+            w_ir = ir_full[start_idx : start_idx + 125]
+            w_red = red_full[start_idx : start_idx + 125]
+            bpm, v_bpm, _, _ = hrcalc.calc_hr_and_spo2(w_ir, w_red)
+            
+            if v_bpm and 45 < bpm < 220:
+                heart_valid = True
+                if bpm > highest_bpm: highest_bpm = bpm
+                if bpm < lowest_bpm: lowest_bpm = bpm
+        except:
+            continue
+
+    # --- UPDATED STATUS LOGIC ---
+    # NEW: Trigger STRESSED if Temp < 29.0 OR Change > 0.6
+    if avg_temp < 29.0 or temp_delta > 0.6:
+        s1_state = "STRESSED"
+    else:
+        s1_state = "CALM"
+
+    # GSR Logic (Trigger if sweat rises 15%)
+    s2_state = "STRESSED" if (avg_gsr > (gsr_start * 1.15)) else "CALM"
+    
+    # Heart Rate Logic (Trigger if > 80 OR < 60)
+    if heart_valid:
+        if highest_bpm > 80 or lowest_bpm < 58:
+            s3_state = "STRESSED"
+        else:
+            s3_state = "CALM"
+    else:
+        s3_state = "NO SIGNAL"
+
+    # Consensus (Triggered if even 1 marker hits)
+    score = (1 if s1_state == "STRESSED" else 0) + \
+            (1 if s2_state == "STRESSED" else 0) + \
+            (1 if s3_state == "STRESSED" else 0)
+    
+    final_res = "STRESSED" if score >= 2 else "CALM"
+
+    # --- FINAL CLEAN REPORT ---
+    os.system('clear')
+    print("====================================================")
+    print(f"            DETECTION RESULT: {final_res}        ")
+    print("====================================================")
+    print(f" Body Temperature  :    {s1_state}")
+    print(f" Skin Conductance  :    {s2_state}")
+    print(f" Cardiac Rhythm    :    {s3_state}")
+    print("----------------------------------------------------")
+    print(f" BIOMETRIC CONSENSUS: {score}/3")
+    print("====================================================")
+
+if __name__ == "__main__":
+    try:
+        run_viva_final()
+    except Exception as e:
+        print(f"\nHardware Error: {e}")
